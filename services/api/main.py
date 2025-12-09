@@ -150,17 +150,91 @@ async def trigger_scrape(product: dict):
 
 
 async def trigger_processing(product: dict):
-    """Trigger Spark processing for a product"""
+    """Trigger Spark processing for a product via Spark API"""
     try:
-        # This would typically trigger a Spark job
-        # For now, we'll update the status
+        product_name = product["name"]
+        product_id = str(product["_id"])
+
         db.products.update_one(
-            {"_id": ObjectId(product["_id"])}, {"$set": {"status": "processing"}}
+            {"_id": ObjectId(product_id)}, {"$set": {"status": "processing"}}
         )
-        logger.info(f"Processing triggered for {product['name']}")
+        logger.info(f"Processing triggered for {product_name}")
+
+        # Call Spark API to submit job
+        spark_api_url = "http://spark-master:8888/submit"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                spark_api_url, json={"product_name": product_name}
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                job_id = result.get("job_id")
+                logger.info(f"Spark job submitted: {result}")
+
+                # Poll for job completion
+                status_url = f"http://spark-master:8888/status/{job_id}"
+                max_attempts = 60  # 10 minutes max (10s * 60)
+
+                for attempt in range(max_attempts):
+                    await asyncio.sleep(10)  # Check every 10 seconds
+
+                    try:
+                        status_response = await client.get(status_url)
+                        if status_response.status_code == 200:
+                            status = status_response.json()
+                            logger.info(f"Job {job_id} status: {status.get('status')}")
+
+                            if status.get("status") == "completed":
+                                db.products.update_one(
+                                    {"_id": ObjectId(product_id)},
+                                    {
+                                        "$set": {
+                                            "status": "processed",
+                                            "last_processed": datetime.utcnow(),
+                                        }
+                                    },
+                                )
+                                logger.info(
+                                    f"Spark processing completed for {product_name}"
+                                )
+                                return
+                            elif status.get("status") in ["failed", "error", "timeout"]:
+                                error_msg = status.get("error", "Unknown error")
+                                logger.error(f"Spark processing failed: {error_msg}")
+                                db.products.update_one(
+                                    {"_id": ObjectId(product_id)},
+                                    {
+                                        "$set": {
+                                            "status": "processing_failed",
+                                            "error": error_msg,
+                                        }
+                                    },
+                                )
+                                return
+                    except Exception as poll_err:
+                        logger.warning(f"Error polling job status: {poll_err}")
+
+                # Timeout waiting for job
+                logger.warning(f"Timeout waiting for Spark job {job_id}")
+                db.products.update_one(
+                    {"_id": ObjectId(product_id)},
+                    {"$set": {"status": "processing_timeout"}},
+                )
+            else:
+                logger.error(f"Failed to submit Spark job: {response.text}")
+                db.products.update_one(
+                    {"_id": ObjectId(product_id)},
+                    {"$set": {"status": "processing_failed", "error": response.text}},
+                )
 
     except Exception as e:
         logger.error(f"Failed to trigger processing: {e}")
+        db.products.update_one(
+            {"_id": ObjectId(product["_id"])},
+            {"$set": {"status": "processing_failed", "error": str(e)}},
+        )
 
 
 async def generate_faqs_task(product: dict):
@@ -408,7 +482,7 @@ async def list_all_faqs():
 # Full pipeline endpoint
 @app.post("/api/pipeline/{product_id}")
 async def run_full_pipeline(product_id: str, background_tasks: BackgroundTasks):
-    """Run the full pipeline: scrape -> process -> generate FAQs"""
+    """Run the full pipeline: scrape -> process (Spark) -> generate FAQs"""
     try:
         doc = db.products.find_one({"_id": ObjectId(product_id)})
     except Exception:
@@ -419,28 +493,52 @@ async def run_full_pipeline(product_id: str, background_tasks: BackgroundTasks):
 
     async def run_pipeline(product: dict):
         """Run full pipeline sequentially"""
+        product_id = str(product["_id"])
+        product_name = product["name"]
+
         try:
             # Step 1: Scrape
-            logger.info(f"Pipeline: Starting scrape for {product['name']}")
+            logger.info(f"Pipeline: Step 1/3 - Starting scrape for {product_name}")
+            db.products.update_one(
+                {"_id": ObjectId(product_id)}, {"$set": {"status": "pipeline_scraping"}}
+            )
             await trigger_scrape(product)
-            await asyncio.sleep(60)  # Wait for scraping
 
-            # Step 2: Process (would trigger Spark)
-            logger.info(f"Pipeline: Starting processing for {product['name']}")
+            # Wait for scraping to complete (poll status or wait fixed time)
+            # In production, you'd use a message queue or callback
+            await asyncio.sleep(90)  # Wait for scraping to complete
+
+            # Step 2: Spark Processing
+            logger.info(
+                f"Pipeline: Step 2/3 - Starting Spark processing for {product_name}"
+            )
+            db.products.update_one(
+                {"_id": ObjectId(product_id)},
+                {"$set": {"status": "pipeline_processing"}},
+            )
             await trigger_processing(product)
-            await asyncio.sleep(30)  # Wait for processing
 
             # Step 3: Generate FAQs
-            logger.info(f"Pipeline: Starting FAQ generation for {product['name']}")
+            logger.info(
+                f"Pipeline: Step 3/3 - Starting FAQ generation for {product_name}"
+            )
+            db.products.update_one(
+                {"_id": ObjectId(product_id)},
+                {"$set": {"status": "pipeline_generating"}},
+            )
             await generate_faqs_task(product)
 
-            logger.info(f"Pipeline: Completed for {product['name']}")
+            db.products.update_one(
+                {"_id": ObjectId(product_id)},
+                {"$set": {"status": "pipeline_completed"}},
+            )
+            logger.info(f"Pipeline: Completed successfully for {product_name}")
 
         except Exception as e:
-            logger.error(f"Pipeline failed: {e}")
+            logger.error(f"Pipeline failed for {product_name}: {e}")
             db.products.update_one(
-                {"_id": ObjectId(product["_id"])},
-                {"$set": {"status": "error", "error": str(e)}},
+                {"_id": ObjectId(product_id)},
+                {"$set": {"status": "pipeline_error", "error": str(e)}},
             )
 
     background_tasks.add_task(run_pipeline, doc)
@@ -448,7 +546,8 @@ async def run_full_pipeline(product_id: str, background_tasks: BackgroundTasks):
     return {
         "message": "Full pipeline started",
         "product": doc["name"],
-        "steps": ["scrape", "process", "generate_faqs"],
+        "steps": ["scrape (Reddit)", "process (Spark)", "generate_faqs (LLM)"],
+        "note": "Pipeline runs in background. Check product status for progress.",
     }
 
 

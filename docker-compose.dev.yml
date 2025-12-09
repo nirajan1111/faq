@@ -198,6 +198,7 @@ services:
       - "7077:7077"
       - "8085:8080"
       - "4040:4040"
+      - "8888:8888"
     environment:
       - SPARK_MODE=master
       - SPARK_MASTER_HOST=spark-master
@@ -210,6 +211,7 @@ services:
     command: >
       bash -c "mkdir -p /opt/spark/logs && 
                /opt/spark/sbin/start-master.sh && 
+               python3 /app/src/api.py &
                tail -f /dev/null"
     networks:
       - faq-network

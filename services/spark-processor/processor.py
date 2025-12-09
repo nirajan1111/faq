@@ -55,18 +55,8 @@ class SparkDataProcessor:
     def __init__(self):
         self.spark = (
             SparkSession.builder.appName("FAQDataProcessor")
-            .config(
-                "spark.jars.packages",
-                "org.mongodb.spark:mongo-spark-connector_2.12:10.2.1",
-            )
-            .config(
-                "spark.mongodb.read.connection.uri",
-                os.getenv("MONGODB_URI", "mongodb://mongodb:27017"),
-            )
-            .config(
-                "spark.mongodb.write.connection.uri",
-                os.getenv("MONGODB_URI", "mongodb://mongodb:27017"),
-            )
+            .config("spark.driver.memory", "1g")
+            .config("spark.executor.memory", "1g")
             .getOrCreate()
         )
 
@@ -97,15 +87,27 @@ class SparkDataProcessor:
     def load_raw_data(self, product: str, source: str = "reddit"):
         """Load raw data from HDFS for a specific product"""
         product_clean = product.replace(" ", "_").lower()
-        path = f"{self.raw_data_path}/{source}/{product_clean}/*.json"
 
-        try:
-            df = self.spark.read.json(path, multiLine=True)
-            logger.info(f"Loaded {df.count()} records for {product}")
-            return df
-        except Exception as e:
-            logger.error(f"Failed to load data: {e}")
-            return None
+        # Try multiple path variants (with and without trailing underscore)
+        path_variants = [
+            f"{self.raw_data_path}/{source}/{product_clean}/*.json",
+            f"{self.raw_data_path}/{source}/{product_clean}_/*.json",
+        ]
+
+        for path in path_variants:
+            try:
+                logger.info(f"Trying to load from: {path}")
+                df = self.spark.read.json(path, multiLine=True)
+                count = df.count()
+                if count > 0:
+                    logger.info(f"Loaded {count} records for {product} from {path}")
+                    return df
+            except Exception as e:
+                logger.warning(f"Path {path} failed: {e}")
+                continue
+
+        logger.error(f"Failed to load data from any path variant for {product}")
+        return None
 
     def clean_text(self, df):
         """Clean and normalize text content"""
@@ -259,7 +261,7 @@ class SparkDataProcessor:
         return faq_ready_df
 
     def save_processed_data(self, df, product: str):
-        """Save processed data to HDFS and MongoDB"""
+        """Save processed data to HDFS"""
         product_clean = product.replace(" ", "_").lower()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -268,11 +270,10 @@ class SparkDataProcessor:
         df.write.mode("overwrite").parquet(hdfs_path)
         logger.info(f"Saved processed data to HDFS: {hdfs_path}")
 
-        # Save to MongoDB for API access
-        df.write.format("mongodb").option("database", "faq_generation").option(
-            "collection", f"processed_{product_clean}"
-        ).mode("overwrite").save()
-        logger.info(f"Saved processed data to MongoDB")
+        # Also save as JSON for easier reading by FAQ generator
+        json_path = f"{self.processed_data_path}/{product_clean}/latest.json"
+        df.coalesce(1).write.mode("overwrite").json(json_path)
+        logger.info(f"Saved JSON data to: {json_path}")
 
         return hdfs_path
 
@@ -312,17 +313,13 @@ class SparkDataProcessor:
         }
 
     def get_processed_data(self, product: str):
-        """Retrieve processed data for a product"""
+        """Retrieve processed data for a product from HDFS"""
         product_clean = product.replace(" ", "_").lower()
 
         try:
-            df = (
-                self.spark.read.format("mongodb")
-                .option("database", "faq_generation")
-                .option("collection", f"processed_{product_clean}")
-                .load()
-            )
-
+            # Read the latest JSON data from HDFS
+            json_path = f"{self.processed_data_path}/{product_clean}/latest.json"
+            df = self.spark.read.json(json_path)
             return df.toPandas().to_dict("records")
         except Exception as e:
             logger.error(f"Failed to retrieve processed data: {e}")

@@ -44,7 +44,8 @@ RUN pip3 install --no-cache-dir \
     numpy==1.26.2 \
     pandas==2.1.3 \
     pyarrow==14.0.1 \
-    nltk==3.8.1
+    nltk==3.8.1 \
+    flask==3.0.0
 
 # Download NLTK data
 RUN python3 -c "import nltk; nltk.download('punkt'); nltk.download('stopwords'); nltk.download('wordnet')"
@@ -53,5 +54,8 @@ WORKDIR /app
 
 # Copy Spark configurations
 COPY spark-defaults.conf ${SPARK_HOME}/conf/spark-defaults.conf
+
+# Expose Spark API port
+EXPOSE 8888
 
 CMD ["bash"]

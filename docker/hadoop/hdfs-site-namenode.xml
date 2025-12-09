@@ -25,4 +25,10 @@
         <name>dfs.webhdfs.enabled</name>
         <value>true</value>
     </property>
+    <!-- Reduced block size for small files (dev environment) -->
+    <property>
+        <name>dfs.blocksize</name>
+        <value>16777216</value>  <!-- 16 MB instead of 128 MB -->
+        <description>Block size in bytes (16 MB)</description>
+    </property>
 </configuration>
