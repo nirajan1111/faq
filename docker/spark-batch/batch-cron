@@ -1,0 +1,2 @@
+# Run batch processing every hour
+0 * * * * cd /app && /usr/local/bin/python -m src.batch.spark_batch >> /app/logs/batch.log 2>&1

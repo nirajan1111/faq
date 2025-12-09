@@ -1,0 +1,350 @@
+version: "3.8"
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES (ARM Compatible)
+  # ============================================
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Apache Kafka (Confluent)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI for monitoring
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: faq-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - faq-network
+
+  # MongoDB (ARM native)
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: faq_generation
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mongo Express (MongoDB UI)
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo-express
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin123
+    networks:
+      - faq-network
+
+  # ============================================
+  # HADOOP / HDFS (ARM Compatible)
+  # ============================================
+
+  namenode:
+    image: apache/hadoop:3
+    container_name: namenode
+    hostname: namenode
+    command: ["hdfs", "namenode"]
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hadoop-namenode:/hadoop/dfs/name
+    environment:
+      HADOOP_HOME: /opt/hadoop
+      ENSURE_NAMENODE_DIR: /hadoop/dfs/name
+    env_file:
+      - ./hadoop/hadoop-arm.env
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9870/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  datanode:
+    image: apache/hadoop:3
+    container_name: datanode
+    hostname: datanode
+    command: ["hdfs", "datanode"]
+    volumes:
+      - hadoop-datanode:/hadoop/dfs/data
+    environment:
+      HADOOP_HOME: /opt/hadoop
+    env_file:
+      - ./hadoop/hadoop-arm.env
+    depends_on:
+      namenode:
+        condition: service_healthy
+    networks:
+      - faq-network
+
+  # ============================================
+  # SPARK (Bitnami - ARM native)
+  # ============================================
+
+  spark-master:
+    image: bitnami/spark:latest
+    container_name: spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+    networks:
+      - faq-network
+
+  spark-worker:
+    image: bitnami/spark:latest
+    container_name: spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    depends_on:
+      - spark-master
+    networks:
+      - faq-network
+
+  # ============================================
+  # OLLAMA (Local LLM - ARM native)
+  # ============================================
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    networks:
+      - faq-network
+    # GPU support for Mac is automatic via Metal
+
+  # ============================================
+  # APPLICATION SERVICES
+  # ============================================
+
+  # Reddit Scraper (Go - ARM build)
+  reddit-scraper:
+    build:
+      context: ./scrapers/reddit-scraper
+      dockerfile: Dockerfile.arm
+    container_name: reddit-scraper
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8081"
+    environment:
+      - REDDIT_CLIENT_ID=${REDDIT_CLIENT_ID}
+      - REDDIT_CLIENT_SECRET=${REDDIT_CLIENT_SECRET}
+      - REDDIT_USER_AGENT=${REDDIT_USER_AGENT}
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_RAW_DATA=raw_social_data
+      - SCRAPE_RATE_LIMIT=100
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  # Kafka Consumer (Python) - Stores data to HDFS via WebHDFS
+  kafka-consumer:
+    build:
+      context: ./services/kafka-consumer
+      dockerfile: Dockerfile
+    container_name: kafka-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_CONSUMER_GROUP=hdfs_storage_consumer
+      - KAFKA_TOPIC_RAW_DATA=raw_social_data
+      - HDFS_NAMENODE_HOST=namenode
+      - HDFS_WEBHDFS_PORT=9870
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  # FAQ Generator Service (Python)
+  faq-generator:
+    build:
+      context: ./services/faq-generator
+      dockerfile: Dockerfile
+    container_name: faq-generator
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - USE_OLLAMA_FALLBACK=true
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=faq_generation
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  # Spark Processor (Python)
+  spark-processor:
+    build:
+      context: ./services/spark-processor
+      dockerfile: Dockerfile
+    container_name: spark-processor
+    depends_on:
+      - spark-master
+      namenode:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+    environment:
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - HDFS_NAMENODE=hdfs://namenode:9000
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=faq_generation
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  # FastAPI Backend
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: faq-api
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=faq_generation
+      - REDDIT_SCRAPER_URL=http://reddit-scraper:8081
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - OLLAMA_HOST=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2
+      - USE_OLLAMA_FALLBACK=true
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  # Next.js Dashboard
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: faq-dashboard
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+# ============================================
+# NETWORKS
+# ============================================
+networks:
+  faq-network:
+    driver: bridge
+
+# ============================================
+# VOLUMES
+# ============================================
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  mongodb-data:
+  hadoop-namenode:
+  hadoop-datanode:
+  ollama-data:

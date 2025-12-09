@@ -1,0 +1,348 @@
+version: "3.8"
+
+# Development Docker Compose - ARM64/Apple Silicon compatible with HDFS
+# Use this for local development and testing on Mac M1/M2/M3
+
+services:
+  # ============================================
+  # INFRASTRUCTURE SERVICES
+  # ============================================
+
+  # Zookeeper for Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Apache Kafka (Confluent)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - faq-network
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-broker-api-versions",
+          "--bootstrap-server",
+          "localhost:9092",
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # Kafka UI (ARM compatible)
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: faq-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - faq-network
+
+  # MongoDB (ARM native)
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Mongo Express (ARM compatible)
+  mongo-express:
+    image: mongo-express:latest
+    container_name: mongo-express
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin123
+    networks:
+      - faq-network
+
+  # ============================================
+  # HADOOP HDFS - ARM Compatible (Custom Build)
+  # ============================================
+
+  # HDFS Namenode
+  namenode:
+    build:
+      context: ./docker/hadoop
+      dockerfile: Dockerfile.namenode
+    container_name: namenode
+    hostname: namenode
+    ports:
+      - "9870:9870" # Web UI
+      - "9000:9000" # HDFS port
+    volumes:
+      - hadoop-namenode:/hadoop/dfs/name
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9870 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # HDFS Datanode
+  datanode:
+    build:
+      context: ./docker/hadoop
+      dockerfile: Dockerfile.datanode
+    container_name: datanode
+    hostname: datanode
+    depends_on:
+      namenode:
+        condition: service_healthy
+    ports:
+      - "9864:9864"
+    volumes:
+      - hadoop-datanode:/hadoop/dfs/data
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9864 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Initialize HDFS directories
+  hdfs-init:
+    build:
+      context: ./docker/hadoop
+      dockerfile: Dockerfile.namenode
+    container_name: hdfs-init
+    depends_on:
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    command: >
+      bash -c "
+        sleep 10 &&
+        hdfs dfs -mkdir -p /data/raw/reddit &&
+        hdfs dfs -mkdir -p /data/raw/twitter &&
+        hdfs dfs -mkdir -p /data/processed &&
+        hdfs dfs -mkdir -p /data/faqs &&
+        hdfs dfs -chmod -R 777 /data &&
+        echo 'HDFS directories created successfully'
+      "
+    networks:
+      - faq-network
+
+  # ============================================
+  # SPARK - ARM Compatible (Custom Build)
+  # ============================================
+
+  spark-master:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: spark-master
+    hostname: spark-master
+    ports:
+      - "7077:7077"
+      - "8085:8080"
+      - "4040:4040"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    volumes:
+      - ./services/spark-processor:/app/src
+      - ./config:/app/config
+      - spark-data:/tmp/spark-events
+    command: >
+      bash -c "mkdir -p /opt/spark/logs && 
+               /opt/spark/sbin/start-master.sh && 
+               tail -f /dev/null"
+    networks:
+      - faq-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  spark-worker:
+    build:
+      context: ./docker/spark
+      dockerfile: Dockerfile
+    container_name: spark-worker
+    hostname: spark-worker
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8086:8081"
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_WEBUI_PORT=8081
+    volumes:
+      - ./services/spark-processor:/app/src
+      - ./config:/app/config
+    command: >
+      bash -c "mkdir -p /opt/spark/logs && 
+               /opt/spark/sbin/start-worker.sh spark://spark-master:7077 && 
+               tail -f /dev/null"
+    networks:
+      - faq-network
+
+  # ============================================
+  # APPLICATION SERVICES
+  # ============================================
+
+  reddit-scraper:
+    build:
+      context: ./scrapers/reddit-scraper
+      dockerfile: Dockerfile.arm
+    container_name: reddit-scraper
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8081"
+    env_file:
+      - .env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_TOPIC_RAW_DATA=raw_social_data
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  kafka-consumer:
+    build:
+      context: ./services/kafka-consumer
+      dockerfile: Dockerfile
+    container_name: kafka-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - KAFKA_CONSUMER_GROUP=hdfs_storage_consumer
+      - KAFKA_TOPIC_RAW_DATA=raw_social_data
+      - STORAGE_TYPE=hdfs
+      - HDFS_NAMENODE_HOST=namenode
+      - HDFS_NAMENODE_PORT=9870
+      - HDFS_URL=http://namenode:9870
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: faq-api
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DATABASE=faq_generation
+      - REDDIT_SCRAPER_URL=http://reddit-scraper:8081
+      - OLLAMA_HOST=http://host.docker.internal:11434
+      - USE_OLLAMA_FALLBACK=true
+      - HDFS_URL=http://namenode:9870
+    volumes:
+      - ./services/faq-generator:/app/services/faq-generator
+    networks:
+      - faq-network
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: faq-dashboard
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000
+    networks:
+      - faq-network
+    restart: unless-stopped
+
+networks:
+  faq-network:
+    driver: bridge
+
+volumes:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  mongodb-data:
+  hadoop-namenode:
+  hadoop-datanode:
+  spark-data:

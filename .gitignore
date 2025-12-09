@@ -1,0 +1,74 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+
+# Go
+scrapers/reddit-scraper/reddit-scraper
+scrapers/twitter-scraper/twitter-scraper
+*.exe
+*.exe~
+*.dll
+*.dylib
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Docker
+.docker/
+
+# Logs
+logs/
+*.log
+
+# Data
+data/
+*.csv
+*.json
+!docker-compose*.yml
+!**/config.json
+
+# Node.js (Dashboard)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/.env.local
+
+# Hadoop/HDFS
+hadoop-data/
+
+# Misc
+.DS_Store
+Thumbs.db
+
+.env.example
