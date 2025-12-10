@@ -70,7 +70,7 @@ class GeminiProvider(LLMProvider):
         content_text = self._prepare_content(content)
 
         prompt = self._create_prompt(product, content_text)
-
+        print("Gemini Prompt:", prompt)
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
                 f"{self.base_url}/models/{self.model}:generateContent",

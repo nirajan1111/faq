@@ -20,6 +20,8 @@ import (
 	"golang.org/x/time/rate"
 )
 
+const maxWorkers = 5 // <-- you asked for 5 workers
+
 // Configuration holds all scraper settings
 type Configuration struct {
 	RedditClientID     string
@@ -87,6 +89,13 @@ type ScrapeRequest struct {
 	Keywords   []string `json:"keywords"`
 }
 
+// Task used by worker pool
+type Task struct {
+	Product   string
+	Subreddit string
+	Keyword   string
+}
+
 // RedditScraper handles Reddit API interactions
 type RedditScraper struct {
 	config      Configuration
@@ -99,7 +108,6 @@ type RedditScraper struct {
 }
 
 func NewRedditScraper(config Configuration) (*RedditScraper, error) {
-	// Create Kafka writer using segmentio/kafka-go (pure Go, ARM compatible)
 	writer := &kafka.Writer{
 		Addr:         kafka.TCP(config.KafkaBootstrap),
 		Topic:        config.KafkaTopic,
@@ -109,7 +117,6 @@ func NewRedditScraper(config Configuration) (*RedditScraper, error) {
 		Async:        false,
 	}
 
-	// Rate limiter: 100 requests per minute = ~1.67 requests per second
 	limiter := rate.NewLimiter(rate.Limit(float64(config.RateLimit)/60.0), config.RateLimit/10)
 
 	return &RedditScraper{
@@ -124,7 +131,6 @@ func (s *RedditScraper) authenticate() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Check if token is still valid
 	if s.accessToken != "" && time.Now().Before(s.tokenExpiry) {
 		return nil
 	}
@@ -158,6 +164,7 @@ func (s *RedditScraper) authenticate() error {
 	}
 
 	s.accessToken = auth.AccessToken
+	// subtract a minute as buffer
 	s.tokenExpiry = time.Now().Add(time.Duration(auth.ExpiresIn-60) * time.Second)
 
 	log.Info("Successfully authenticated with Reddit API")
@@ -167,12 +174,11 @@ func (s *RedditScraper) authenticate() error {
 func (s *RedditScraper) makeRequest(endpoint string) ([]byte, error) {
 	ctx := context.Background()
 
-	// Wait for rate limiter
+	// Rate limiter wait
 	if err := s.limiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("rate limiter error: %w", err)
 	}
 
-	// Ensure we have a valid token
 	if err := s.authenticate(); err != nil {
 		return nil, err
 	}
@@ -196,7 +202,7 @@ func (s *RedditScraper) makeRequest(endpoint string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		// Token expired, re-authenticate
+		// force re-auth
 		s.mu.Lock()
 		s.accessToken = ""
 		s.mu.Unlock()
@@ -318,108 +324,154 @@ func (s *RedditScraper) sendToKafka(data ScrapedData) error {
 	return nil
 }
 
+func (s *RedditScraper) processPost(product, keyword, subreddit string, post RedditPost) {
+	// Skip empty posts
+	if post.Title == "" && post.Selftext == "" {
+		return
+	}
+
+	content := post.Selftext
+	if content == "" {
+		content = post.Title
+	}
+
+	scrapedPost := ScrapedData{
+		Source:    "reddit",
+		Product:   product,
+		DataType:  "post",
+		Content:   content,
+		Title:     post.Title,
+		Author:    post.Author,
+		Score:     post.Score,
+		URL:       "https://reddit.com" + post.Permalink,
+		Subreddit: subreddit,
+		CreatedAt: time.Unix(int64(post.CreatedUTC), 0),
+		ScrapedAt: time.Now(),
+		Metadata: map[string]string{
+			"post_id":      post.ID,
+			"num_comments": fmt.Sprintf("%d", post.NumComments),
+			"keyword":      keyword,
+		},
+	}
+
+	if err := s.sendToKafka(scrapedPost); err != nil {
+		log.WithError(err).Warn("Failed to send post to Kafka")
+	}
+
+	// Fetch comments (sequentially here to avoid lots of concurrent comment fetches)
+	if post.NumComments > 5 {
+		comments, err := s.getComments(post.ID, subreddit, 20)
+		if err != nil {
+			log.WithError(err).Warn("Failed to fetch comments")
+			return
+		}
+
+		for _, comment := range comments {
+			scrapedComment := ScrapedData{
+				Source:    "reddit",
+				Product:   product,
+				DataType:  "comment",
+				Content:   comment.Body,
+				Author:    comment.Author,
+				Score:     comment.Score,
+				URL:       "https://reddit.com" + post.Permalink,
+				Subreddit: subreddit,
+				CreatedAt: time.Unix(int64(comment.CreatedUTC), 0),
+				ScrapedAt: time.Now(),
+				Metadata: map[string]string{
+					"comment_id": comment.ID,
+					"post_id":    post.ID,
+					"parent_id":  comment.ParentID,
+				},
+			}
+			if err := s.sendToKafka(scrapedComment); err != nil {
+				log.WithError(err).Warn("Failed to send comment to Kafka")
+			}
+		}
+	}
+}
+
+// scrapeKeywordForSubreddit handles the work for a single subreddit+keyword combo.
+// It limits per-task concurrency for processing posts using a small semaphore.
+func (s *RedditScraper) scrapeKeywordForSubreddit(product, subreddit, keyword string) {
+	searchQuery := fmt.Sprintf("\"%s\" AND %s", product, keyword)
+
+	posts, err := s.searchPosts(searchQuery, subreddit, 25)
+	if err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"subreddit": subreddit,
+			"keyword":   keyword,
+		}).Warn("Search failed")
+		return
+	}
+
+	// Small semaphore to limit how many posts we process concurrently per task.
+	// This prevents a single task from spawning too many goroutines.
+	const perTaskConcurrency = 3
+	sem := make(chan struct{}, perTaskConcurrency)
+
+	var wg sync.WaitGroup
+	for _, p := range posts {
+		post := p
+		sem <- struct{}{}
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			s.processPost(product, keyword, subreddit, post)
+		}()
+	}
+
+	wg.Wait()
+}
+
+// ScrapeProduct enqueues tasks (subreddit × keyword) and processes them with a worker pool.
 func (s *RedditScraper) ScrapeProduct(request ScrapeRequest) error {
 	log.WithFields(log.Fields{
 		"product":    request.Product,
 		"subreddits": request.Subreddits,
 		"keywords":   request.Keywords,
-	}).Info("Starting scrape for product")
+	}).Info("Starting parallel scrape (worker pool)")
 
-	totalPosts := 0
-	totalComments := 0
+	taskCount := len(request.Subreddits) * len(request.Keywords)
+	taskChan := make(chan Task, taskCount)
 
-	for _, subreddit := range request.Subreddits {
-		for _, keyword := range request.Keywords {
-			searchQuery := fmt.Sprintf("%s %s", request.Product, keyword)
+	var wg sync.WaitGroup
 
-			posts, err := s.searchPosts(searchQuery, subreddit, 25)
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"subreddit": subreddit,
-					"keyword":   keyword,
-				}).Warn("Failed to search posts")
-				continue
+	// Start workers
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskChan {
+				log.WithFields(log.Fields{
+					"worker":    workerID,
+					"subreddit": task.Subreddit,
+					"keyword":   task.Keyword,
+				}).Info("Worker picked up task")
+				s.scrapeKeywordForSubreddit(task.Product, task.Subreddit, task.Keyword)
 			}
+		}(i)
+	}
 
-			for _, post := range posts {
-				// Skip empty posts
-				if post.Title == "" && post.Selftext == "" {
-					continue
-				}
-
-				content := post.Selftext
-				if content == "" {
-					content = post.Title
-				}
-
-				scrapedPost := ScrapedData{
-					Source:    "reddit",
-					Product:   request.Product,
-					DataType:  "post",
-					Content:   content,
-					Title:     post.Title,
-					Author:    post.Author,
-					Score:     post.Score,
-					URL:       "https://reddit.com" + post.Permalink,
-					Subreddit: post.Subreddit,
-					CreatedAt: time.Unix(int64(post.CreatedUTC), 0),
-					ScrapedAt: time.Now(),
-					Metadata: map[string]string{
-						"post_id":      post.ID,
-						"num_comments": fmt.Sprintf("%d", post.NumComments),
-						"keyword":      keyword,
-					},
-				}
-
-				if err := s.sendToKafka(scrapedPost); err != nil {
-					log.WithError(err).Warn("Failed to send post to Kafka")
-				} else {
-					totalPosts++
-				}
-
-				// Get comments for high-engagement posts
-				if post.NumComments > 5 {
-					comments, err := s.getComments(post.ID, subreddit, 20)
-					if err != nil {
-						log.WithError(err).Warn("Failed to get comments")
-						continue
-					}
-
-					for _, comment := range comments {
-						scrapedComment := ScrapedData{
-							Source:    "reddit",
-							Product:   request.Product,
-							DataType:  "comment",
-							Content:   comment.Body,
-							Author:    comment.Author,
-							Score:     comment.Score,
-							URL:       fmt.Sprintf("https://reddit.com%s", post.Permalink),
-							Subreddit: post.Subreddit,
-							CreatedAt: time.Unix(int64(comment.CreatedUTC), 0),
-							ScrapedAt: time.Now(),
-							Metadata: map[string]string{
-								"comment_id": comment.ID,
-								"post_id":    post.ID,
-								"parent_id":  comment.ParentID,
-							},
-						}
-
-						if err := s.sendToKafka(scrapedComment); err != nil {
-							log.WithError(err).Warn("Failed to send comment to Kafka")
-						} else {
-							totalComments++
-						}
-					}
-				}
+	// Enqueue tasks
+	for _, sub := range request.Subreddits {
+		for _, kw := range request.Keywords {
+			taskChan <- Task{
+				Product:   request.Product,
+				Subreddit: sub,
+				Keyword:   kw,
 			}
 		}
 	}
 
+	close(taskChan) // signal workers no more tasks
+	wg.Wait()       // wait for all workers to finish
+
 	log.WithFields(log.Fields{
-		"product":        request.Product,
-		"total_posts":    totalPosts,
-		"total_comments": totalComments,
-	}).Info("Completed scrape for product")
+		"product": request.Product,
+	}).Info("Completed parallel scrape")
 
 	return nil
 }
@@ -461,7 +513,7 @@ func (h *HTTPServer) handleScrape(w http.ResponseWriter, r *http.Request) {
 		request.Keywords = []string{"review", "problem", "issue", "help", "question", "experience", "opinion"}
 	}
 
-	// Run scrape in background
+	// Run scrape in background (one goroutine per HTTP request)
 	go func() {
 		if err := h.scraper.ScrapeProduct(request); err != nil {
 			log.WithError(err).Error("Scrape failed")
@@ -482,7 +534,7 @@ func (h *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 func loadConfig() Configuration {
 	// Try to load .env file
-	godotenv.Load()
+	_ = godotenv.Load()
 
 	rateLimit := 100
 	if rl := os.Getenv("SCRAPE_RATE_LIMIT"); rl != "" {

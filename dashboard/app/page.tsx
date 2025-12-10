@@ -2,12 +2,12 @@
 
 import { useState, useEffect } from 'react'
 import axios from 'axios'
-import { 
-  Plus, 
-  RefreshCw, 
-  Trash2, 
-  Play, 
-  MessageSquare, 
+import {
+  Plus,
+  RefreshCw,
+  Trash2,
+  Play,
+  MessageSquare,
   Loader2,
   Search,
   ChevronDown,
@@ -15,9 +15,10 @@ import {
   ExternalLink,
   AlertCircle,
   CheckCircle,
-  Clock
+  Clock,
+  Settings
 } from 'lucide-react'
-import { format } from 'date-fns'
+import Link from 'next/link'
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
 
@@ -216,13 +217,22 @@ export default function Home() {
               <h1 className="text-2xl font-bold text-gray-900">FAQ Generation Dashboard</h1>
               <p className="text-sm text-gray-500 mt-1">Generate FAQs from social media discussions</p>
             </div>
-            <button
-              onClick={() => setShowAddModal(true)}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              Add Product
-            </button>
+            <div className="flex items-center gap-3">
+              <Link
+                href="/admin"
+                className="inline-flex items-center gap-2 px-4 py-2 text-gray-700 bg-gray-100 rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                <Settings className="w-4 h-4" />
+                Admin
+              </Link>
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="inline-flex items-center gap-2 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                Add Product
+              </button>
+            </div>
           </div>
         </div>
       </header>

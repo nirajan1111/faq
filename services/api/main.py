@@ -52,10 +52,14 @@ faq_service = FAQGeneratorService()
 class ProductCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
-    subreddits: Optional[List[str]] = None  # Now optional - will auto-discover if not provided
+    subreddits: Optional[List[str]] = (
+        None  # Now optional - will auto-discover if not provided
+    )
     keywords: List[str] = Field(default=["review", "problem", "help", "question"])
     category: Optional[str] = None
-    auto_discover_subreddits: bool = Field(default=True, description="Automatically discover subreddits if not provided")
+    auto_discover_subreddits: bool = Field(
+        default=True, description="Automatically discover subreddits if not provided"
+    )
 
 
 class ProductResponse(BaseModel):
@@ -138,14 +142,12 @@ async def discover_subreddits(topic: str, top_n: int = 3) -> List[str]:
         # Clean the topic for search (remove special chars, make lowercase)
         search_query = topic.strip().lower()
 
-        headers = {
-            "User-Agent": "FAQ-Generator/1.0"
-        }
+        headers = {"User-Agent": "FAQ-Generator/1.0"}
 
         params = {
             "q": search_query,
             "limit": 10,  # Get more results to filter from
-            "sort": "relevance"
+            "sort": "relevance",
         }
 
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -162,17 +164,16 @@ async def discover_subreddits(topic: str, top_n: int = 3) -> List[str]:
                     subscribers = subreddit_data.get("subscribers", 0)
 
                     if name and subscribers > 1000:  # Filter out very small subreddits
-                        subreddits.append({
-                            "name": name,
-                            "subscribers": subscribers
-                        })
+                        subreddits.append({"name": name, "subscribers": subscribers})
 
                 # Sort by subscriber count and get top N
                 subreddits.sort(key=lambda x: x["subscribers"], reverse=True)
                 top_subreddits = [s["name"] for s in subreddits[:top_n]]
 
                 if top_subreddits:
-                    logger.info(f"Discovered subreddits for '{topic}': {top_subreddits}")
+                    logger.info(
+                        f"Discovered subreddits for '{topic}': {top_subreddits}"
+                    )
                     return top_subreddits
                 else:
                     logger.warning(f"No subreddits found for '{topic}', using defaults")
@@ -370,7 +371,9 @@ async def create_product(product: ProductCreate):
 
     # Auto-discover subreddits if not provided or if auto_discover is enabled
     subreddits = product.subreddits
-    if (subreddits is None or len(subreddits) == 0) and product.auto_discover_subreddits:
+    if (
+        subreddits is None or len(subreddits) == 0
+    ) and product.auto_discover_subreddits:
         logger.info(f"Auto-discovering subreddits for '{product.name}'")
         subreddits = await discover_subreddits(product.name, top_n=3)
         logger.info(f"Discovered subreddits: {subreddits}")
@@ -583,7 +586,7 @@ async def run_full_pipeline(product_id: str, background_tasks: BackgroundTasks):
             await trigger_scrape(product)
 
             # Wait for scraping to complete (poll status or wait fixed time)
-            # In production, you'd use a message queue or callback
+            # In production, message use garne plan xa tarw na bihauna ni sakinxa
             await asyncio.sleep(90)  # Wait for scraping to complete
 
             # Step 2: Spark Processing
