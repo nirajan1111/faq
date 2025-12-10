@@ -64,7 +64,6 @@ export default function Home() {
   const [newProduct, setNewProduct] = useState({
     name: '',
     description: '',
-    subreddits: 'technology,gadgets',
     keywords: 'review,problem,help,question,experience',
     category: ''
   })
@@ -109,12 +108,11 @@ export default function Home() {
       await axios.post(`${API_URL}/api/products`, {
         name: newProduct.name,
         description: newProduct.description || null,
-        subreddits: newProduct.subreddits.split(',').map(s => s.trim()),
         keywords: newProduct.keywords.split(',').map(k => k.trim()),
         category: newProduct.category || null
       })
       setShowAddModal(false)
-      setNewProduct({ name: '', description: '', subreddits: 'technology,gadgets', keywords: 'review,problem,help,question,experience', category: '' })
+      setNewProduct({ name: '', description: '', keywords: 'review,problem,help,question,experience', category: '' })
       fetchProducts()
       fetchStats()
     } catch (error: any) {
@@ -464,6 +462,7 @@ export default function Home() {
           <div className="bg-white rounded-xl shadow-xl w-full max-w-md mx-4">
             <div className="p-4 border-b">
               <h2 className="text-lg font-semibold text-gray-900">Add New Product</h2>
+              <p className="text-xs text-gray-500 mt-1">Relevant subreddits will be automatically discovered</p>
             </div>
             <div className="p-4 space-y-4">
               <div>
@@ -488,18 +487,6 @@ export default function Home() {
                   placeholder="Brief description of the product"
                   className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                   rows={2}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Subreddits (comma-separated)
-                </label>
-                <input
-                  type="text"
-                  value={newProduct.subreddits}
-                  onChange={(e) => setNewProduct({ ...newProduct, subreddits: e.target.value })}
-                  placeholder="technology,gadgets,samsung"
-                  className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                 />
               </div>
               <div>

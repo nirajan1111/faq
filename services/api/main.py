@@ -52,9 +52,10 @@ faq_service = FAQGeneratorService()
 class ProductCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: Optional[str] = None
-    subreddits: List[str] = Field(default=["technology", "gadgets"])
+    subreddits: Optional[List[str]] = None  # Now optional - will auto-discover if not provided
     keywords: List[str] = Field(default=["review", "problem", "help", "question"])
     category: Optional[str] = None
+    auto_discover_subreddits: bool = Field(default=True, description="Automatically discover subreddits if not provided")
 
 
 class ProductResponse(BaseModel):
@@ -117,6 +118,73 @@ def serialize_doc(doc: dict) -> dict:
         doc["id"] = str(doc["_id"])
         del doc["_id"]
     return doc
+
+
+async def discover_subreddits(topic: str, top_n: int = 3) -> List[str]:
+    """
+    Automatically discover relevant subreddits for a topic using Reddit's search API
+
+    Args:
+        topic: The product/topic name to search for
+        top_n: Number of top subreddits to return (default: 3)
+
+    Returns:
+        List of subreddit names (without 'r/' prefix)
+    """
+    try:
+        # Reddit's subreddit search endpoint
+        search_url = "https://www.reddit.com/subreddits/search.json"
+
+        # Clean the topic for search (remove special chars, make lowercase)
+        search_query = topic.strip().lower()
+
+        headers = {
+            "User-Agent": "FAQ-Generator/1.0"
+        }
+
+        params = {
+            "q": search_query,
+            "limit": 10,  # Get more results to filter from
+            "sort": "relevance"
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(search_url, headers=headers, params=params)
+
+            if response.status_code == 200:
+                data = response.json()
+                subreddits = []
+
+                # Extract subreddit names and subscriber counts
+                for child in data.get("data", {}).get("children", []):
+                    subreddit_data = child.get("data", {})
+                    name = subreddit_data.get("display_name")
+                    subscribers = subreddit_data.get("subscribers", 0)
+
+                    if name and subscribers > 1000:  # Filter out very small subreddits
+                        subreddits.append({
+                            "name": name,
+                            "subscribers": subscribers
+                        })
+
+                # Sort by subscriber count and get top N
+                subreddits.sort(key=lambda x: x["subscribers"], reverse=True)
+                top_subreddits = [s["name"] for s in subreddits[:top_n]]
+
+                if top_subreddits:
+                    logger.info(f"Discovered subreddits for '{topic}': {top_subreddits}")
+                    return top_subreddits
+                else:
+                    logger.warning(f"No subreddits found for '{topic}', using defaults")
+                    return ["technology", "gadgets"]
+
+            else:
+                logger.error(f"Reddit API error: {response.status_code}")
+                return ["technology", "gadgets"]
+
+    except Exception as e:
+        logger.error(f"Failed to discover subreddits: {e}")
+        return ["technology", "gadgets"]  # Fallback to defaults
 
 
 # Background tasks
@@ -300,10 +368,20 @@ async def create_product(product: ProductCreate):
     if existing:
         raise HTTPException(status_code=400, detail="Product already exists")
 
+    # Auto-discover subreddits if not provided or if auto_discover is enabled
+    subreddits = product.subreddits
+    if (subreddits is None or len(subreddits) == 0) and product.auto_discover_subreddits:
+        logger.info(f"Auto-discovering subreddits for '{product.name}'")
+        subreddits = await discover_subreddits(product.name, top_n=3)
+        logger.info(f"Discovered subreddits: {subreddits}")
+    elif subreddits is None or len(subreddits) == 0:
+        # Fallback to defaults if auto-discovery is disabled
+        subreddits = ["technology", "gadgets"]
+
     doc = {
         "name": product.name,
         "description": product.description,
-        "subreddits": product.subreddits,
+        "subreddits": subreddits,
         "keywords": product.keywords,
         "category": product.category,
         "created_at": datetime.utcnow(),
